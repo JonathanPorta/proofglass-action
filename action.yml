@@ -1,0 +1,49 @@
+name: proofglass
+description: Enqueue and wait for a Proof Glass Playwright visual regression job
+
+inputs:
+  edge-url:
+    description: Proof Glass Edge Worker URL
+    required: true
+  edge-token:
+    description: Token allowed to enqueue/poll visual jobs
+    required: true
+  repo:
+    description: GitHub repository in owner/name format
+    required: true
+  sha:
+    description: Commit SHA to test
+    required: true
+  ref:
+    description: Branch, tag, or ref name
+    required: true
+  suite:
+    description: Named suite to run
+    required: false
+    default: visual
+  required-capabilities:
+    description: Comma-separated required runner capabilities
+    required: false
+    default: node,make,playwright,chromium
+  required-labels:
+    description: Comma-separated required runner labels
+    required: false
+    default: local,trusted
+  timeout-seconds:
+    description: Maximum time to wait for the remote visual result
+    required: false
+    default: '1800'
+  poll-seconds:
+    description: Poll interval
+    required: false
+    default: '10'
+
+outputs:
+  job-id:
+    description: Proof Glass job ID
+  status:
+    description: Final job status
+
+runs:
+  using: node24
+  main: dist/index.js
