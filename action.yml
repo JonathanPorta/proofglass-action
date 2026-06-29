@@ -17,6 +17,13 @@ inputs:
   ref:
     description: Branch, tag, or ref name
     required: true
+  pr:
+    description: >-
+      Pull request number to associate this job with, so it appears on the
+      console's PR checks page. Auto-detected from the GitHub event payload on
+      pull_request runs when omitted; set explicitly to override.
+    required: false
+    default: ''
   suite:
     description: Named suite to run
     required: false

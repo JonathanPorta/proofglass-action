@@ -1,7 +1,40 @@
 "use strict";
 
 // src/index.ts
+var import_node_fs2 = require("fs");
+
+// src/context.ts
 var import_node_fs = require("fs");
+function readEvent(env) {
+  const path = env.GITHUB_EVENT_PATH;
+  if (!path) return null;
+  try {
+    return JSON.parse((0, import_node_fs.readFileSync)(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function readPrContext(env, prInput) {
+  const event = readEvent(env);
+  const ctx = {};
+  const explicit = (prInput ?? "").trim();
+  if (explicit) {
+    if (!/^[1-9][0-9]*$/.test(explicit)) {
+      throw new Error(`invalid "pr" input ${JSON.stringify(prInput)} \u2014 expected a positive integer`);
+    }
+    ctx.pr_number = Number.parseInt(explicit, 10);
+  } else if (typeof event?.pull_request?.number === "number" && event.pull_request.number > 0) {
+    ctx.pr_number = event.pull_request.number;
+  } else {
+    const m = /^refs\/pull\/([1-9][0-9]*)\//.exec(env.GITHUB_REF ?? "");
+    if (m) ctx.pr_number = Number.parseInt(m[1], 10);
+  }
+  const branch = event?.pull_request?.head?.ref || env.GITHUB_HEAD_REF || env.GITHUB_REF_NAME;
+  if (branch) ctx.branch = branch;
+  return ctx;
+}
+
+// src/index.ts
 var TERMINAL = ["passed", "failed", "error", "cancelled"];
 function getInput(name, opts = {}) {
   const value = (process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "").trim();
@@ -12,12 +45,12 @@ function getInput(name, opts = {}) {
 }
 function setOutput(name, value) {
   const file = process.env.GITHUB_OUTPUT;
-  if (file) (0, import_node_fs.appendFileSync)(file, `${name}=${value}
+  if (file) (0, import_node_fs2.appendFileSync)(file, `${name}=${value}
 `);
 }
 function writeSummary(markdown) {
   const file = process.env.GITHUB_STEP_SUMMARY;
-  if (file) (0, import_node_fs.appendFileSync)(file, markdown + "\n");
+  if (file) (0, import_node_fs2.appendFileSync)(file, markdown + "\n");
 }
 var splitList = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -67,6 +100,7 @@ async function main() {
   const requiredLabels = splitList(getInput("required-labels") || "local,trusted");
   const timeoutSeconds = Number.parseInt(getInput("timeout-seconds") || "1800", 10);
   const pollSeconds = Math.max(1, Number.parseInt(getInput("poll-seconds") || "10", 10));
+  const { pr_number, branch } = readPrContext(process.env, getInput("pr"));
   const auth = { authorization: `Bearer ${edgeToken}`, "content-type": "application/json" };
   const body = {
     repo,
@@ -75,12 +109,15 @@ async function main() {
     suite,
     required_capabilities: requiredCapabilities,
     required_labels: requiredLabels,
+    ...pr_number !== void 0 ? { pr_number } : {},
+    ...branch ? { branch } : {},
     created_by: {
       source: "github_action",
       actor: process.env.GITHUB_ACTOR,
       workflow_run_id: process.env.GITHUB_RUN_ID
     }
   };
+  if (pr_number !== void 0) notice(`Proof Glass associating job with PR #${pr_number}`);
   const createRes = await fetch(`${edgeUrl}/api/jobs`, {
     method: "POST",
     headers: auth,
