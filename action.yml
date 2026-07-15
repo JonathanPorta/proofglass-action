@@ -44,6 +44,28 @@ inputs:
     description: Poll interval
     required: false
     default: '10'
+  comment:
+    description: >-
+      Post a sticky PR comment with the result + failure reasons (opt-in).
+      Requires the job's `pull-requests: write` permission.
+    required: false
+    default: 'false'
+  comment-on-pass:
+    description: Also comment when the job passes (default: comment only on failure).
+    required: false
+    default: 'false'
+  github-token:
+    description: Token used to post the PR comment (needs pull-requests:write).
+    required: false
+    default: ${{ github.token }}
+  comment-author:
+    description: >-
+      Login the sticky PR comment is authored as, so re-runs update it instead of
+      duplicating. Defaults to the built-in github-actions[bot]; set this only when
+      overriding github-token with another credential (a GitHub App posts as
+      `<app-slug>[bot]`, a PAT as the user login).
+    required: false
+    default: ''
 
 outputs:
   job-id:
