@@ -1,8 +1,16 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
+  # Manual-only for now — auto-release on push to main is intentionally NOT
+  # enabled. The mirror's `main` has no branch protection yet, and the
+  # publish-surfaces / promotion-handshake standards require a PR-gated
+  # promotion flow + protected branch before public tags and the `v1` alias may
+  # move. Those are tracked as later items in JonathanPorta/proofglass#62. Once
+  # branch protection + the promotion-PR flow land, re-enable auto-release by
+  # adding:
+  #   push:
+  #     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: release
@@ -17,8 +25,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Skip if the push was made by the bot itself (e.g., the .version bump commit)
-    # to prevent an infinite release loop.
+    # Skip if triggered by the bot itself (e.g., the .version bump commit) to
+    # prevent an infinite release loop if push-triggering is later enabled.
     if: github.actor != 'github-actions[bot]'
     steps:
       - name: Checkout
@@ -33,8 +41,17 @@ jobs:
           # decide-bump.sh reads PR labels via the GitHub API; gh needs a token.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get the latest tag, or default to v0.0.0
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          set -euo pipefail
+
+          # Version state must come ONLY from immutable release tags. `git
+          # describe --tags` would pick up the moving `v1` major alias this
+          # workflow force-moves, corrupting the arithmetic (e.g. "v1..1"). Select
+          # strict vX.Y.Z tags, sort them semantically, and take the highest.
+          LATEST_TAG=$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1 || true)
+          LATEST_TAG="${LATEST_TAG:-v0.0.0}"
           echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
 
           # Parse current version
@@ -67,19 +84,21 @@ jobs:
             RANGE_COMMITS=$(git rev-list "${LATEST_TAG}..HEAD")
           fi
 
-          # Don't silently swallow API failures: a permission/auth/rate-limit
-          # error would otherwise drop every label and quietly fall back to the
-          # commit-prefix path with no signal. On failure, emit a workflow
-          # warning and keep going (the fallback is still a sensible default).
+          # A FAILED label query (auth / permission / rate-limit / network) must
+          # abort the release — NOT silently fall back to commit prefixes, which
+          # could permanently publish a lower immutable version than an explicit
+          # `major`/`minor` label intended. Only a SUCCESSFUL query that finds no
+          # applicable label lets decide-bump.sh use the commit-prefix fallback.
           LABELS=""
           for sha in $RANGE_COMMITS; do
             if pr_labels=$(gh api "repos/${{ github.repository }}/commits/${sha}/pulls" \
-                 --jq '.[].labels[].name' 2>&1); then
+                 --jq '.[].labels[].name'); then
               if [[ -n "$pr_labels" ]]; then
                 LABELS="${LABELS}${pr_labels}"$'\n'
               fi
             else
-              echo "::warning::Could not read PR labels for ${sha}; using commit-prefix fallback for it. (${pr_labels})"
+              echo "::error::Label query failed for ${sha} (commit→pulls API). Refusing to release on partial version signal; re-run once the API is reachable."
+              exit 1
             fi
           done
 
@@ -127,39 +146,54 @@ jobs:
             git push
           fi
 
-      - name: Create tag
+      # Publish order is deliberate and idempotent: create/verify the immutable
+      # tag, then create/verify the GitHub Release, and ONLY THEN move the `v1`
+      # alias. If any step fails, the widely consumed `v1` has not advanced, so a
+      # re-run recovers cleanly instead of leaving a half-published state.
+      - name: Create or verify the immutable tag
         if: steps.version.outputs.skip != 'true'
         run: |
+          set -euo pipefail
           NEW_TAG="${{ steps.version.outputs.new_tag }}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${NEW_TAG}" &>/dev/null; then
-            echo "Tag ${NEW_TAG} already exists on remote — skipping tag creation."
+          RELEASE_SHA=$(git rev-parse HEAD)
+          remote_line=$(git ls-remote --tags origin "refs/tags/${NEW_TAG}" || true)
+          if [[ -n "$remote_line" ]]; then
+            REMOTE_SHA=$(printf '%s\n' "$remote_line" | awk '{print $1}' | head -n1)
+            if [[ "$REMOTE_SHA" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${NEW_TAG} already exists but points at ${REMOTE_SHA}, not the release commit ${RELEASE_SHA}. Refusing to overwrite an immutable tag."
+              exit 1
+            fi
+            echo "Tag ${NEW_TAG} already present and matches the release commit — ok (idempotent re-run)."
           else
-            git tag "$NEW_TAG"
+            git tag "$NEW_TAG" "$RELEASE_SHA"
             git push origin "$NEW_TAG"
+            echo "Created tag ${NEW_TAG} at ${RELEASE_SHA}."
           fi
 
-      - name: Move major tag (v1 → latest v1.x)
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          NEW_TAG="${{ steps.version.outputs.new_tag }}"
-          MAJOR="v${NEW_TAG#v}"; MAJOR="${MAJOR%%.*}"
-          # Force the moving major alias to the new release commit so
-          # `uses: JonathanPorta/proofglass-action@v1` always resolves the latest v1.x.
-          # (Required by the publish-surfaces standard.)
-          git tag -f "$MAJOR" "$NEW_TAG"
-          git push -f origin "$MAJOR"
-          echo "Moved ${MAJOR} → ${NEW_TAG}"
-
-      - name: Create GitHub Release
+      - name: Create or verify the GitHub Release
         if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           NEW_TAG="${{ steps.version.outputs.new_tag }}"
           if gh release view "$NEW_TAG" &>/dev/null; then
-            echo "Release ${NEW_TAG} already exists — skipping release creation."
+            echo "Release ${NEW_TAG} already exists — ok (idempotent re-run)."
           else
             gh release create "$NEW_TAG" \
               --title "$NEW_TAG" \
+              --target "$(git rev-parse HEAD)" \
               --generate-notes
           fi
+
+      - name: Move the major alias (v1 → latest v1.x) — final step
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.version.outputs.new_tag }}"
+          MAJOR="${NEW_TAG%%.*}"   # v1.2.3 → v1
+          # Move the alias ONLY after the immutable tag + Release exist, so a
+          # failure above never advances `v1` past a real release.
+          git tag -f "$MAJOR" "$NEW_TAG"
+          git push -f origin "$MAJOR"
+          echo "Moved ${MAJOR} → ${NEW_TAG}"
