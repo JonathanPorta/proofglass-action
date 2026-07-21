@@ -1,0 +1,250 @@
+name: Release
+
+on:
+  # Manual-only, and the job below is fail-closed OFF (see its `if:`). Auto-
+  # release on push to main is intentionally NOT enabled: the mirror's `main`
+  # has no branch protection yet, and the publish-surfaces / promotion-handshake
+  # standards require a PR-gated promotion flow + protected branch/environment
+  # before public tags and the `v1` alias may move. Tracked as later items in
+  # JonathanPorta/proofglass#62. To activate once those land: create the
+  # protected `github-release` environment (required reviewers), set repo
+  # variable RELEASE_SURFACE_ENABLED=true, and add:
+  #   push:
+  #     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # Needed to read the labels of PRs associated with each commit since the
+  # last tag (commit→pulls API) when deciding the version bump.
+  pull-requests: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Fail-closed deferral (proofglass#62). The publisher stays NON-RUNNABLE
+    # until the release-authority items land; it runs only when ALL hold:
+    #   - not the release bot itself (no self-trigger loop)
+    #   - RELEASE_SURFACE_ENABLED repo variable is 'true' — UNSET today, so the
+    #     job is skipped; flip it on only after branch protection + the
+    #     promotion-PR flow exist
+    #   - the selected ref IS the default branch, so a manual dispatch cannot
+    #     publish an arbitrary feature branch/tag as the public `v1`
+    if: >-
+      github.actor != 'github-actions[bot]'
+      && vars.RELEASE_SURFACE_ENABLED == 'true'
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # Publishing is gated on this environment; configure it with required
+    # reviewers + branch restrictions before enabling the variable above.
+    environment: github-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version bump
+        id: version
+        env:
+          # decide-bump.sh reads PR labels via the GitHub API; gh needs a token.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Version state must come ONLY from immutable release tags. `git
+          # describe --tags` would pick up the moving `v1` major alias this
+          # workflow force-moves, corrupting the arithmetic (e.g. "v1..1"). Select
+          # strict vX.Y.Z tags, sort them semantically, and take the highest.
+          LATEST_TAG=$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1 || true)
+          LATEST_TAG="${LATEST_TAG:-v0.0.0}"
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          TAG_SHA=""
+          if [[ "$LATEST_TAG" != "v0.0.0" ]]; then
+            TAG_SHA=$(git rev-parse "${LATEST_TAG}^{commit}" 2>/dev/null || echo "")
+          fi
+
+          # REPAIR vs RELEASE. If HEAD is already the highest immutable tag, this
+          # is NOT a new release — it is a publication-repair check. Resume any
+          # missing publish steps (they are idempotent); skip ONLY when the tag,
+          # a published non-draft/non-prerelease Release, AND the major alias are
+          # all present and consistent. This is the path a re-run takes after a
+          # mid-publish failure, so it must NOT short-circuit to skip.
+          if [[ -n "$TAG_SHA" && "$TAG_SHA" == "$HEAD_SHA" ]]; then
+            NEW_TAG="$LATEST_TAG"
+            echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+            echo "repair=true" >> "$GITHUB_OUTPUT"
+
+            release_ok=false
+            if rjson=$(gh release view "$NEW_TAG" --json isDraft,isPrerelease,tagName 2>/dev/null); then
+              if [[ "$(jq -r '.isDraft' <<<"$rjson")" == "false" \
+                 && "$(jq -r '.isPrerelease' <<<"$rjson")" == "false" \
+                 && "$(jq -r '.tagName' <<<"$rjson")" == "$NEW_TAG" ]]; then
+                release_ok=true
+              fi
+            fi
+
+            MAJOR="${NEW_TAG%%.*}"
+            alias_sha=$(git ls-remote --tags origin "refs/tags/${MAJOR}" | awk '{print $1}' | head -n1 || true)
+            alias_ok=false
+            [[ -n "$alias_sha" && "$alias_sha" == "$HEAD_SHA" ]] && alias_ok=true
+
+            if [[ "$release_ok" == "true" && "$alias_ok" == "true" ]]; then
+              echo "Publication complete for ${NEW_TAG} — nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Publication incomplete for ${NEW_TAG} (release_ok=${release_ok}, alias_ok=${alias_ok}) — resuming publish steps."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # New release: HEAD is beyond the latest immutable tag.
+          echo "repair=false" >> "$GITHUB_OUTPUT"
+          VERSION="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          if [[ "$LATEST_TAG" == "v0.0.0" ]]; then
+            COMMITS=$(git log --oneline)
+            RANGE_COMMITS=$(git rev-list HEAD)
+          else
+            COMMITS=$(git log "${LATEST_TAG}..HEAD" --oneline)
+            RANGE_COMMITS=$(git rev-list "${LATEST_TAG}..HEAD")
+          fi
+
+          if [[ -z "$COMMITS" ]]; then
+            echo "No new commits since ${LATEST_TAG} — nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bump is driven by PR labels (version: major/minor/patch), with the
+          # commit-prefix scan as a fallback for unlabeled PRs. Squash-merges
+          # collapse each PR to one commit on main, so we recover the PR via the
+          # commit→pulls API. A FAILED query (auth / permission / rate-limit /
+          # network) must ABORT — never silently fall back to prefixes, which
+          # could permanently publish a lower version than an explicit label.
+          # Only a SUCCESSFUL query that finds no label uses the prefix fallback.
+          LABELS=""
+          for sha in $RANGE_COMMITS; do
+            if pr_labels=$(gh api "repos/${{ github.repository }}/commits/${sha}/pulls" \
+                 --jq '.[].labels[].name'); then
+              if [[ -n "$pr_labels" ]]; then
+                LABELS="${LABELS}${pr_labels}"$'\n'
+              fi
+            else
+              echo "::error::Label query failed for ${sha} (commit→pulls API). Refusing to release on partial version signal; re-run once the API is reachable."
+              exit 1
+            fi
+          done
+
+          # decide-bump.sh: labels on stdin, commit fallback via $BUMP_COMMITS.
+          # Vendored under .ai-rules/ in this mirror (no root scripts/).
+          BUMP=$(printf '%s\n' "$LABELS" | BUMP_COMMITS="$COMMITS" .ai-rules/scripts/decide-bump.sh)
+          echo "Resolved bump: ${BUMP}"
+
+          if [[ "$BUMP" == "major" ]]; then
+            MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+          elif [[ "$BUMP" == "minor" ]]; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${LATEST_TAG} → ${NEW_TAG}"
+
+      # .version bump + commit only on a NEW release (in repair mode HEAD is
+      # already the tagged commit, so re-committing would create an untagged head).
+      - name: Update .version file
+        if: steps.version.outputs.skip != 'true' && steps.version.outputs.repair != 'true'
+        run: |
+          cat > .version <<EOF
+          origin=https://github.com/${{ github.repository }}
+          tag=${{ steps.version.outputs.new_tag }}
+          EOF
+          sed -i 's/^[[:space:]]*//' .version
+
+      - name: Commit version bump
+        if: steps.version.outputs.skip != 'true' && steps.version.outputs.repair != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .version
+          if git diff --cached --quiet; then
+            echo "No changes to .version — skipping commit"
+          else
+            git commit -m "chore: bump version to ${{ steps.version.outputs.new_tag }}"
+            git push
+          fi
+
+      # Publish order is deliberate and idempotent: create/verify the immutable
+      # tag, then create/verify a PUBLISHED Release, and ONLY THEN move the `v1`
+      # alias. Every step is safe to re-run, and the version step above reaches
+      # them again (repair mode) after any mid-publish failure.
+      - name: Create or verify the immutable tag
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.version.outputs.new_tag }}"
+          RELEASE_SHA=$(git rev-parse HEAD)
+          remote_line=$(git ls-remote --tags origin "refs/tags/${NEW_TAG}" || true)
+          if [[ -n "$remote_line" ]]; then
+            REMOTE_SHA=$(printf '%s\n' "$remote_line" | awk '{print $1}' | head -n1)
+            if [[ "$REMOTE_SHA" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${NEW_TAG} already exists but points at ${REMOTE_SHA}, not the release commit ${RELEASE_SHA}. Refusing to overwrite an immutable tag."
+              exit 1
+            fi
+            echo "Tag ${NEW_TAG} already present and matches the release commit — ok (idempotent re-run)."
+          else
+            git tag "$NEW_TAG" "$RELEASE_SHA"
+            git push origin "$NEW_TAG"
+            echo "Created tag ${NEW_TAG} at ${RELEASE_SHA}."
+          fi
+
+      - name: Create or verify a published GitHub Release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.version.outputs.new_tag }}"
+          if rjson=$(gh release view "$NEW_TAG" --json isDraft,isPrerelease,tagName 2>/dev/null); then
+            draft=$(jq -r '.isDraft' <<<"$rjson")
+            pre=$(jq -r '.isPrerelease' <<<"$rjson")
+            tag=$(jq -r '.tagName' <<<"$rjson")
+            if [[ "$tag" != "$NEW_TAG" || "$draft" != "false" || "$pre" != "false" ]]; then
+              echo "::error::Release ${NEW_TAG} exists but is not a published stable release (tag=${tag} draft=${draft} prerelease=${pre}). Refusing to advance the major alias onto it."
+              exit 1
+            fi
+            echo "Release ${NEW_TAG} already published (stable) — ok (idempotent re-run)."
+          else
+            gh release create "$NEW_TAG" \
+              --title "$NEW_TAG" \
+              --target "$(git rev-parse HEAD)" \
+              --generate-notes
+            echo "Created published Release ${NEW_TAG}."
+          fi
+
+      - name: Move the major alias (v1 → latest v1.x) — final step
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.version.outputs.new_tag }}"
+          MAJOR="${NEW_TAG%%.*}"   # v1.2.3 → v1
+          # Move the alias ONLY after the immutable tag + published Release exist,
+          # so a failure above never advances `v1` past a real, complete release.
+          git tag -f "$MAJOR" "$NEW_TAG"
+          git push -f origin "$MAJOR"
+          echo "Moved ${MAJOR} → ${NEW_TAG}"
