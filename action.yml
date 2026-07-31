@@ -51,7 +51,11 @@ inputs:
     required: false
     default: 'false'
   comment-on-pass:
-    description: Also comment when the job passes (default: comment only on failure).
+    # QUOTED DELIBERATELY: a plain (unquoted) YAML scalar may not contain ": ",
+    # and "(default: comment only on failure)" does. Unquoted, this made the
+    # whole manifest unparseable — every consumer failed at "Set up job" with
+    # "Failed to load action.yml", before the action ever ran.
+    description: 'Also comment when the job passes (default: comment only on failure).'
     required: false
     default: 'false'
   github-token:
