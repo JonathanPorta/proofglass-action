@@ -8,6 +8,15 @@ inputs:
   edge-token:
     description: Token allowed to enqueue/poll visual jobs
     required: true
+  console-url:
+    description: >-
+      Base URL of the Proof Glass console, used for the human-facing links in
+      the job summary and PR comment (screenshots, report, manifest). Those
+      pages serve ONLY on the console host; the API host 404s them. Defaults to
+      edge-url, which is correct when one origin serves both and wrong when they
+      are split (e.g. api.* vs app.*) — set it explicitly in that case.
+    required: false
+    default: ''
   repo:
     description: GitHub repository in owner/name format
     required: true

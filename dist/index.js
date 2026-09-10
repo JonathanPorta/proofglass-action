@@ -18,7 +18,7 @@ var DEFAULT_BOT_LOGIN = "github-actions[bot]";
 function oneLine(msg) {
   return (msg || "see report").split("\n")[0].replace(/\|/g, "\\|").slice(0, MAX_ERR);
 }
-function renderComment(edgeUrl, jobId, status, job) {
+function renderComment(consoleUrl, jobId, status, job) {
   const emoji = STATUS_EMOJI[status] ?? "\u2022";
   const out = [MARKER, `## Proof Glass \u2014 \`${status}\` ${emoji}`, ""];
   if (job?.result?.summary) out.push(job.result.summary, "");
@@ -49,8 +49,8 @@ function renderComment(edgeUrl, jobId, status, job) {
     }
     if (failures.length > shown) out.push(`_\u2026and ${failures.length - shown} more \u2014 see the report._`, "");
   }
-  const links = [`[Console](${edgeUrl}/ui/jobs/${jobId}/screenshots)`];
-  if (job?.result?.report_url) links.push(`[Playwright report](${edgeUrl}${job.result.report_url})`);
+  const links = [`[Console](${consoleUrl}/ui/jobs/${jobId}/screenshots)`];
+  if (job?.result?.report_url) links.push(`[Playwright report](${consoleUrl}${job.result.report_url})`);
   out.push(links.join(" \xB7 "));
   return out.join("\n");
 }
@@ -173,7 +173,7 @@ var STATUS_EMOJI2 = {
   cancelled: "\u26AA",
   timed_out: "\u23F1\uFE0F"
 };
-function renderSummary(edgeUrl, jobId, status, job) {
+function renderSummary(consoleUrl, jobId, status, job) {
   const emoji = STATUS_EMOJI2[status] ?? "\u2022";
   const lines = [
     "## Proof Glass \u2014 visual regression",
@@ -191,8 +191,8 @@ function renderSummary(edgeUrl, jobId, status, job) {
     if (job.assigned_runner_id) lines.push(`| Runner | \`${job.assigned_runner_id}\` |`);
     if (job.result?.summary) lines.push(`| Summary | ${job.result.summary} |`);
     const links = [];
-    if (job.result?.report_url) links.push(`[Report](${edgeUrl}${job.result.report_url})`);
-    if (job.result?.manifest_url) links.push(`[Manifest](${edgeUrl}${job.result.manifest_url})`);
+    if (job.result?.report_url) links.push(`[Report](${consoleUrl}${job.result.report_url})`);
+    if (job.result?.manifest_url) links.push(`[Manifest](${consoleUrl}${job.result.manifest_url})`);
     if (links.length) lines.push(`| Artifacts | ${links.join(" \xB7 ")} |`);
   }
   return lines.join("\n");
@@ -200,6 +200,7 @@ function renderSummary(edgeUrl, jobId, status, job) {
 async function main() {
   const edgeUrl = getInput("edge-url", { required: true }).replace(/\/+$/, "");
   const edgeToken = getInput("edge-token", { required: true });
+  const consoleUrl = (getInput("console-url") || edgeUrl).replace(/\/+$/, "");
   const repo = getInput("repo", { required: true });
   const sha = getInput("sha", { required: true });
   const ref = getInput("ref", { required: true });
@@ -256,7 +257,7 @@ async function main() {
     await sleep(pollSeconds * 1e3);
   }
   setOutput("status", status);
-  writeSummary(renderSummary(edgeUrl, jobId, status, job));
+  writeSummary(renderSummary(consoleUrl, jobId, status, job));
   const githubToken = getInput("github-token");
   if (
     // pr_number !== undefined first so TS narrows it to `number` for postSticky
@@ -274,7 +275,7 @@ async function main() {
         repo,
         prNumber: pr_number,
         token: githubToken,
-        body: renderComment(edgeUrl, jobId, status, job),
+        body: renderComment(consoleUrl, jobId, status, job),
         // Only set when overriding github-token with a non-default credential, so
         // the sticky comment can recognize its own prior comment (defaults to the
         // built-in github-actions[bot] identity otherwise).
