@@ -12,42 +12,41 @@ var STATUS_EMOJI = {
   cancelled: "\u26AA",
   timed_out: "\u23F1\uFE0F"
 };
-var MAX_FAILURES = 20;
-var MAX_ERR = 1200;
 var DEFAULT_BOT_LOGIN = "github-actions[bot]";
-function oneLine(msg) {
-  return (msg || "see report").split("\n")[0].replace(/\|/g, "\\|").slice(0, MAX_ERR);
+var CONSOLE_DETAILS = "Details are in the Proof Glass console (sign-in required).";
+function tests(n) {
+  return `${n} test${n === 1 ? "" : "s"}`;
+}
+function publicSummary(status, failures = []) {
+  if (status === "passed") return `The tests passed. ${CONSOLE_DETAILS}`;
+  if (status === "failed") {
+    if (!failures.length) return `The tests failed. ${CONSOLE_DETAILS}`;
+    const visual = failures.filter((f) => f.kind === "visual").length;
+    const behavioral = failures.filter((f) => f.kind === "behavioral").length;
+    const kinds = [visual && `${visual} visual`, behavioral && `${behavioral} behavioral`].filter(Boolean).join(", ");
+    return `${tests(failures.length)} failed${kinds ? ` (${kinds})` : ""}. ${CONSOLE_DETAILS}`;
+  }
+  return `The job did not produce a verdict (${status}). ${CONSOLE_DETAILS}`;
 }
 function renderComment(consoleUrl, jobId, status, job) {
   const emoji = STATUS_EMOJI[status] ?? "\u2022";
   const out = [MARKER, `## Proof Glass \u2014 \`${status}\` ${emoji}`, ""];
-  if (job?.result?.summary) out.push(job.result.summary, "");
   const failures = job?.result?.failures ?? [];
-  if (failures.length) {
-    const groups = [
-      [
-        "\u{1F5BC}\uFE0F Visual regressions",
-        "_Pixels changed vs the committed baseline \u2014 approve the new actual as the baseline in the console if the change is intended._",
-        failures.filter((f) => f.kind === "visual")
-      ],
-      [
-        "\u{1F9EA} Behavioral failures",
-        "_Assertions failed (not a screenshot diff) \u2014 nothing to approve; fix the test or the app._",
-        failures.filter((f) => f.kind === "behavioral")
-      ]
-    ];
-    let shown = 0;
-    for (const [heading, note, group] of groups) {
-      if (!group.length) continue;
-      out.push(`### ${heading} (${group.length})`, note, "");
-      for (const f of group) {
-        if (shown >= MAX_FAILURES) break;
-        out.push(`- **${f.test}** (\`${f.file}\`) \u2014 \`${oneLine(f.message)}\``);
-        shown++;
-      }
-      out.push("");
-    }
-    if (failures.length > shown) out.push(`_\u2026and ${failures.length - shown} more \u2014 see the report._`, "");
+  out.push(publicSummary(status, failures), "");
+  const groups = [
+    [
+      "\u{1F5BC}\uFE0F Visual regressions",
+      "_Pixels changed vs the committed baseline \u2014 approve the new actual as the baseline in the console if the change is intended._",
+      failures.filter((f) => f.kind === "visual").length
+    ],
+    [
+      "\u{1F9EA} Behavioral failures",
+      "_Assertions failed (not a screenshot diff) \u2014 nothing to approve; fix the test or the app._",
+      failures.filter((f) => f.kind === "behavioral").length
+    ]
+  ];
+  for (const [heading, note, count] of groups) {
+    if (count) out.push(`### ${heading} (${count})`, note, "");
   }
   const links = [`[Console](${consoleUrl}/ui/jobs/${jobId}/screenshots)`];
   if (job?.result?.report_url) links.push(`[Playwright report](${consoleUrl}${job.result.report_url})`);
@@ -143,6 +142,38 @@ function readPrContext(env, prInput) {
   return ctx;
 }
 
+// src/summary.ts
+var STATUS_EMOJI2 = {
+  passed: "\u2705",
+  failed: "\u274C",
+  error: "\u{1F7E0}",
+  cancelled: "\u26AA",
+  timed_out: "\u23F1\uFE0F"
+};
+function renderSummary(consoleUrl, jobId, status, job) {
+  const emoji = STATUS_EMOJI2[status] ?? "\u2022";
+  const lines = [
+    "## Proof Glass \u2014 visual regression",
+    "",
+    `**Status:** ${emoji} \`${status}\``,
+    "",
+    "| | |",
+    "|---|---|",
+    `| Job | \`${jobId}\` |`
+  ];
+  if (job) {
+    lines.push(`| Repo | \`${job.repo}\` |`);
+    lines.push(`| Commit | \`${job.sha}\` |`);
+    lines.push(`| Suite | \`${job.suite}\` |`);
+    lines.push(`| Summary | ${publicSummary(status, job.result?.failures)} |`);
+    const links = [];
+    if (job.result?.report_url) links.push(`[Report](${consoleUrl}${job.result.report_url})`);
+    if (job.result?.manifest_url) links.push(`[Manifest](${consoleUrl}${job.result.manifest_url})`);
+    if (links.length) lines.push(`| Artifacts | ${links.join(" \xB7 ")} |`);
+  }
+  return lines.join("\n");
+}
+
 // src/index.ts
 var TERMINAL = ["passed", "failed", "error", "cancelled"];
 function getInput(name, opts = {}) {
@@ -166,37 +197,6 @@ var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 var notice = (msg) => console.log(`::notice::${msg}`);
 var warning = (msg) => console.log(`::warning::${msg}`);
 var errorCmd = (msg) => console.log(`::error::${msg}`);
-var STATUS_EMOJI2 = {
-  passed: "\u2705",
-  failed: "\u274C",
-  error: "\u{1F7E0}",
-  cancelled: "\u26AA",
-  timed_out: "\u23F1\uFE0F"
-};
-function renderSummary(consoleUrl, jobId, status, job) {
-  const emoji = STATUS_EMOJI2[status] ?? "\u2022";
-  const lines = [
-    "## Proof Glass \u2014 visual regression",
-    "",
-    `**Status:** ${emoji} \`${status}\``,
-    "",
-    "| | |",
-    "|---|---|",
-    `| Job | \`${jobId}\` |`
-  ];
-  if (job) {
-    lines.push(`| Repo | \`${job.repo}\` |`);
-    lines.push(`| Commit | \`${job.sha}\` |`);
-    lines.push(`| Suite | \`${job.suite}\` |`);
-    if (job.assigned_runner_id) lines.push(`| Runner | \`${job.assigned_runner_id}\` |`);
-    if (job.result?.summary) lines.push(`| Summary | ${job.result.summary} |`);
-    const links = [];
-    if (job.result?.report_url) links.push(`[Report](${consoleUrl}${job.result.report_url})`);
-    if (job.result?.manifest_url) links.push(`[Manifest](${consoleUrl}${job.result.manifest_url})`);
-    if (links.length) lines.push(`| Artifacts | ${links.join(" \xB7 ")} |`);
-  }
-  return lines.join("\n");
-}
 async function main() {
   const edgeUrl = getInput("edge-url", { required: true }).replace(/\/+$/, "");
   const edgeToken = getInput("edge-token", { required: true });

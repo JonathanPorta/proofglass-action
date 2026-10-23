@@ -55,7 +55,7 @@ inputs:
     default: '10'
   comment:
     description: >-
-      Post a sticky PR comment with the result + failure reasons (opt-in).
+      Post a sticky PR comment with the result + failure counts (opt-in; details in the console).
       Requires the job's `pull-requests: write` permission.
     required: false
     default: 'false'
